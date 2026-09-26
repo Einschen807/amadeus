@@ -1,0 +1,55 @@
+# Track only the maintained source projects and documentation at the root.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/UnityCompanion/
+!/EmoteTest/
+!/.codex-integration/
+!/牧濑红莉栖_陪伴型AI人格设定.md
+!/启动红莉栖陪伴程序.cmd
+!/启动红莉栖测试.cmd
+
+# Unity source, settings and dependency manifests; never generated state.
+/UnityCompanion/*
+!/UnityCompanion/.gitignore
+!/UnityCompanion/README.md
+!/UnityCompanion/Assets/
+!/UnityCompanion/Packages/
+!/UnityCompanion/ProjectSettings/
+
+# Game-derived portrait stays local until distribution rights are confirmed.
+/UnityCompanion/Assets/Resources/kurisu.png
+/UnityCompanion/Assets/Resources/kurisu.png.meta
+
+# Preserve the optional renderer's source and third-party notice only.
+/EmoteTest/*
+!/EmoteTest/Program.cs
+!/EmoteTest/build.ps1
+!/EmoteTest/prepare_models.py
+!/EmoteTest/prepare-models.ps1
+!/EmoteTest/AmadeusTest.exe.config
+!/EmoteTest/README.md
+!/EmoteTest/FreeMote.LICENSE.txt
+
+# The editor checks depend on this fixture, but their runs contain local data.
+/.codex-integration/*
+!/.codex-integration/mock_server.py
+
+# Local credentials, conversations and generated files (including future copies).
+.env
+.env.*
+!.env.example
+deepseek-key.bin
+conversation.json
+conversation.json.*
+codex-settings.json
+codex-tasks.json
+codex-tasks.json.*
+auth.json
+*.log
+*.bak
+*.tmp
+__pycache__/
+.vs/
+.idea/
