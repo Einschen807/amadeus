@@ -47,8 +47,13 @@ namespace KurisuCompanion
         public static IEnumerator Send(string apiKey, string persona, string context, List<ChatTurn> history,
             string userText, string imageDataUrl,
             Func<string, string, Action<bool>, IEnumerator> askApproval,
-            Action<string> onProgress, Action<string> onSuccess, Action<string> onError)
+            Action<string> onProgress, Action<string> onSuccess, Action<string> onError, Action<string> onDelta = null, Func<bool> cancelled = null, Action<BilingualSentence> onSpeech = null, bool allowTools = true)
         {
+            cancelled = cancelled ?? (() => false);
+            // 安全层先于人设：识别到风险时，本轮指令紧贴用户消息放置，优先级高于角色规则。
+            RiskLevel risk = SafetyGuard.Assess(userText);
+            string turnRule = SafetyGuard.Instruction(risk);
+            if (risk != RiskLevel.None) Metrics.Count("safety." + risk.ToString().ToLowerInvariant());
             var exchanges = new List<Exchange>();
             int totalActions = 0;
             int screenCaptures = 0;
@@ -59,36 +64,56 @@ namespace KurisuCompanion
                 if (codexReport == null) onError(error);
                 else onSuccess("整理回复时出了点问题，先把执行器实际返回的结果给你。别重复提交同一个任务。\n\n" + codexReport);
             };
-            bool forceFirstAction = AgentRouter.ShouldUseAgent(userText) || CodexRouter.IsComplexRequest(userText);
+            RouteDecision route = allowTools ? AgentRouter.Decide(userText) : RouteDecision.Chat;
+            if (allowTools) Metrics.Count("router.rule_" + route.ToString().ToLowerInvariant());
+            if (route == RouteDecision.Ambiguous)
+            {
+                onProgress("正在理解你的意图……");
+                yield return IntentClassifier.Classify(apiKey, userText, cancelled, value => route = value);
+                if (cancelled()) yield break;
+            }
+            bool forceFirstAction = route == RouteDecision.Computer || route == RouteDecision.Codex;
+            bool preferCodex = route == RouteDecision.Codex;
             bool retryWithRequiredTool = false;
+            bool characterRetry = false, retriedCharacter = false;
             for (int round = 0; round < 9; round++)
             {
+                if (cancelled()) yield break;
                 onProgress(round == 0 ? "正在分析任务……" : "正在整理工具结果……");
                 bool requireTool = (round == 0 && forceFirstAction) || retryWithRequiredTool;
                 string body = BuildBody(persona, context, history, userText, imageDataUrl,
-                    exchanges, round == 8 || delegated, requireTool);
+                    exchanges, round == 8 || delegated, requireTool, allowTools, preferCodex, characterRetry, turnRule);
+                if (onSpeech != null) body = BilingualBuffer.ConstrainRequest(body);
                 retryWithRequiredTool = false;
+                characterRetry = false;
                 ApiResponse parsed = null;
-                using (var request = UnityWebRequest.Post(Endpoint, body, "application/json"))
-                {
-                    request.SetRequestHeader("Authorization", "Bearer " + apiKey);
-                    request.timeout = 90;
-                    yield return request.SendWebRequest();
-                    try { parsed = JsonUtility.FromJson<ApiResponse>(request.downloadHandler.text); }
-                    catch { reportError("Agent 无法解析模型返回的消息。"); yield break; }
-                    if (request.result != UnityWebRequest.Result.Success)
-                    {
-                        string detail = parsed?.error?.message;
-                        reportError("Agent API 请求失败：HTTP " + request.responseCode +
-                                (string.IsNullOrWhiteSpace(detail) ? " " + request.error : " " + detail));
-                        yield break;
-                    }
-                }
+                string streamed = null, streamError = null;
+                var bilingual = onSpeech == null ? null : new BilingualBuffer(onSpeech);
+                Action<string> receive = bilingual == null ? onDelta : bilingual.Push;
+                yield return AgentStream.Read(Endpoint, apiKey, body, cancelled, receive,
+                    value => streamed = value, value => streamError = value);
+                if (cancelled()) yield break;
+                if (streamError != null) { reportError(streamError); yield break; }
+                try { parsed = JsonUtility.FromJson<ApiResponse>(streamed); }
+                catch { reportError("Agent 无法解析模型返回的消息。"); yield break; }
                 AgentMessage message = parsed?.choices != null && parsed.choices.Length > 0 ? parsed.choices[0].message : null;
                 if (message == null) { reportError("Agent 没有返回有效消息。"); yield break; }
                 if (message.tool_calls == null || message.tool_calls.Length == 0)
                 {
-                    string answer = (message.content ?? "").Trim();
+                    bilingual?.Finish();
+                    // 所有句子都被角色一致性过滤掉时，界面上什么都没播，可以安全地重新生成一次。
+                    if (bilingual != null && bilingual.Error == null && bilingual.Count == 0 && bilingual.Dropped > 0)
+                    {
+                        if (!retriedCharacter && round < 8) { retriedCharacter = characterRetry = true; Metrics.Count("persona.retry"); continue; }
+                        if (FinishWithRoleFallback(userText, onSpeech, onSuccess)) yield break;
+                        reportError("Agent 回复未通过角色一致性检查。"); yield break;
+                    }
+                    if (bilingual != null && (bilingual.Error != null || bilingual.Count == 0)) {
+                        Debug.LogWarning("VOICE_FORMAT_FALLBACK records="+bilingual.Count+" chars="+(message.content??"").Length);
+                        if (!bilingual.RecoverPlainChinese(message.content)) { reportError("回复格式异常且没有可显示的中文，请重试。"); yield break; }
+                    }
+                    if (bilingual != null && bilingual.TextOnlyFallback) onProgress("本句语音格式异常，已保留中文回复。");
+                    string answer = bilingual == null ? (message.content ?? "").Trim() : bilingual.Chinese;
                     if (answer.Length == 0) { reportError("Agent 返回了空回复。"); yield break; }
                     if (requireTool) { onError("模型没有按要求调用电脑工具，操作未执行。"); yield break; }
                     if (round == 0 && AgentRouter.IsDirectRequest(userText) &&
@@ -99,13 +124,30 @@ namespace KurisuCompanion
                         onProgress("正在重新尝试电脑操作……");
                         continue;
                     }
-                    if (RoleGuard.IsOutOfCharacter(answer)) { reportError("Agent 回复未通过角色一致性检查。"); yield break; }
+                    if (RoleGuard.IsOutOfCharacter(answer))
+                    {
+                        Metrics.Count("persona.ooc_reply");
+                        // 只有尚未向用户展示任何内容时才重试，避免同一轮出现两段不同回答。
+                        bool nothingShown = bilingual == null && onDelta == null;
+                        if (nothingShown && !retriedCharacter && round < 8) { retriedCharacter = characterRetry = true; Metrics.Count("persona.retry"); continue; }
+                        if (nothingShown && FinishWithRoleFallback(userText, onSpeech, onSuccess)) yield break;
+                        reportError("Agent 回复未通过角色一致性检查。"); yield break;
+                    }
+                    if (risk == RiskLevel.Crisis && !SafetyGuard.MentionsHelp(answer))
+                    {
+                        // 模型漏掉求助渠道时由程序补上，不依赖生成结果。
+                        var helpLine = SafetyGuard.HelpLine();
+                        onSpeech?.Invoke(helpLine);
+                        answer += "\n" + helpLine.Chinese;
+                        Metrics.Count("safety.helpline_appended");
+                    }
                     onSuccess(answer);
                     yield break;
                 }
                 if (round == 8) { onError("Agent 超过了单次任务的步骤上限，请继续下达后续指令。"); yield break; }
                 foreach (var call in message.tool_calls)
                 {
+                    if (cancelled()) yield break;
                     if (call == null || string.IsNullOrWhiteSpace(call.id) || call.function == null)
                     {
                         onError("Agent 返回了不完整的工具调用，操作未执行。");
@@ -116,6 +158,7 @@ namespace KurisuCompanion
                 exchanges.Add(exchange);
                 foreach (var call in message.tool_calls)
                 {
+                    if (cancelled()) yield break;
                     string output = null, toolImage = null;
                     if (call.function.name == "delegate_codex")
                     {
@@ -154,14 +197,30 @@ namespace KurisuCompanion
             onError("Agent 未能在步骤限制内完成任务。");
         }
 
+        // 用户明确要求"别扮演了"而模型两次都跳出角色时，用固定的角色内回应收尾，而不是报错。
+        private static bool FinishWithRoleFallback(string userText, Action<BilingualSentence> onSpeech, Action<string> onSuccess)
+        {
+            if (!RoleGuard.IsRoleSwitchRequest(userText)) return false;
+            string fallback = RoleGuard.FallbackForRoleSwitch(userText);
+            onSpeech?.Invoke(new BilingualSentence { Chinese = fallback, Emotion = "serious", Gesture = "none", Complete = true });
+            Metrics.Count("persona.fallback");
+            onSuccess(fallback);
+            return true;
+        }
+
         private static string BuildBody(string persona, string context, List<ChatTurn> history,
-            string text, string image, List<Exchange> exchanges, bool finalOnly, bool requireTool)
+            string text, string image, List<Exchange> exchanges, bool finalOnly, bool requireTool, bool allowTools,
+            bool preferCodex = false, bool characterRetry = false, string turnRule = null)
         {
             var json = new StringBuilder(14000);
-            json.Append("{\"model\":\"deepseek-flash\",\"stream\":false,\"max_tokens\":3500,")
-                .Append("\"thinking\":{\"type\":\"disabled\"},\"tool_choice\":")
-                .Append(finalOnly ? "\"none\"" : requireTool && CodexRouter.IsComplexRequest(text) ? "{\"type\":\"function\",\"function\":{\"name\":\"delegate_codex\"}}" : requireTool ? "\"required\"" : "\"auto\"")
-                .Append(",\"parallel_tool_calls\":false,\"tools\":[").Append(ToolSchema).Append(',').Append(CodexSchema).Append("],\"messages\":[");
+            json.Append("{\"model\":\"deepseek-flash\",\"stream\":true,\"max_tokens\":")
+                .Append(allowTools ? "1800" : "240")
+                .Append(",\"thinking\":{\"type\":\"disabled\"}");
+            if (allowTools)
+                json.Append(",\"tool_choice\":")
+                    .Append(finalOnly ? "\"none\"" : requireTool && preferCodex ? "{\"type\":\"function\",\"function\":{\"name\":\"delegate_codex\"}}" : requireTool ? "\"required\"" : "\"auto\"")
+                    .Append(",\"parallel_tool_calls\":false,\"tools\":[").Append(ToolSchema).Append(',').Append(CodexSchema).Append(']');
+            json.Append(",\"messages\":[");
             string computerPaths = "\n电脑路径：Agent 工作目录=" + AgentTools.WorkspacePath +
                 "；桌面=" + Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory) +
                 "；文档=" + Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments) +
@@ -170,7 +229,9 @@ namespace KurisuCompanion
             AppendSimple(json, "system", persona);
             if (!string.IsNullOrWhiteSpace(context)) { json.Append(','); AppendSimple(json, "system", context); }
             foreach (var turn in history) { json.Append(','); AppendSimple(json, turn.Role, turn.Text); }
-            json.Append(','); AppendSimple(json, "system", AgentRule + computerPaths + "\n" + CodexService.Context);
+            if (allowTools) { json.Append(','); AppendSimple(json, "system", AgentRule + computerPaths + "\n" + CodexService.Context); }
+            if (characterRetry) { json.Append(','); AppendSimple(json, "system", RoleGuard.RetryRule); }
+            if (!string.IsNullOrEmpty(turnRule)) { json.Append(','); AppendSimple(json, "system", turnRule); }
             json.Append(','); AppendUser(json, text, image);
             foreach (var exchange in exchanges)
             {

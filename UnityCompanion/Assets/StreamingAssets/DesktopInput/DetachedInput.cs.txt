@@ -1,0 +1,136 @@
+using System;
+using System.Drawing;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
+
+// Built with the Windows .NET Framework compiler. This window owns its STA message loop and IME.
+internal sealed class DetachedInput : Form {
+ sealed class Message { public string op, value, attachment; public bool enabled; }
+ sealed class Owner : IWin32Window { public IntPtr Handle { get; set; } }
+ sealed class Editor : TextBox {
+  public Action Submit; bool composing;
+  protected override void WndProc(ref System.Windows.Forms.Message m) {
+   if(m.Msg==0x10d)composing=true; if(m.Msg==0x10e)composing=false;
+   base.WndProc(ref m);
+  }
+  protected override void OnKeyDown(KeyEventArgs e){
+   if(e.KeyCode==Keys.Enter&&!e.Shift&&!composing){e.Handled=true;e.SuppressKeyPress=true;if(Submit!=null)Submit();return;}
+   base.OnKeyDown(e);
+  }
+ }
+ sealed class ReturnButton : Button {
+  public ReturnButton(){FlatStyle=FlatStyle.Flat;FlatAppearance.BorderSize=0;FlatAppearance.MouseOverBackColor=Color.FromArgb(38,38,38);TabStop=false;}
+  protected override void OnPaint(PaintEventArgs e){
+   e.Graphics.Clear(BackColor);e.Graphics.SmoothingMode=System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+   using(var pen=new Pen(Enabled?Color.Gainsboro:Color.DimGray,2)){
+    int x=Width/2,y=Height/2;e.Graphics.DrawLines(pen,new[]{new Point(x+10,y-9),new Point(x+10,y+3),new Point(x-10,y+3)});
+    e.Graphics.DrawLines(pen,new[]{new Point(x-3,y-4),new Point(x-10,y+3),new Point(x-3,y+10)});
+   }
+  }
+ }
+ [StructLayout(LayoutKind.Sequential)] struct Rect {public int left,top,right,bottom;}
+ [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h,out Rect r);
+ [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+ [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+ [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+ [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int w,int height,uint flags);
+ [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h,int command);
+ [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+ [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+ readonly JavaScriptSerializer json=new JavaScriptSerializer(); readonly object outputLock=new object();
+ readonly Owner owner; readonly Editor editor=new Editor(); readonly ReturnButton send=new ReturnButton();
+ readonly Label attachmentLabel=new Label(); readonly Button remove=new Button();
+ readonly Panel hover=new Panel(); readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer();
+ bool wanted,allowSend,closing,updating; string attachment="";
+ public DetachedInput(IntPtr handle){
+  owner=new Owner{Handle=handle};Text="红莉栖 · 文字输入";FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;
+  StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;BackColor=Color.FromArgb(20,20,20);Padding=new Padding(1);
+  Font=new Font("Microsoft YaHei UI",12);Size=new Size(620,90);
+  editor.Multiline=true;editor.AcceptsReturn=true;editor.MaxLength=16000;editor.BorderStyle=BorderStyle.None;
+  editor.BackColor=BackColor;editor.ForeColor=Color.WhiteSmoke;editor.Font=Font;editor.ScrollBars=ScrollBars.Vertical;
+  editor.ScrollBars=ScrollBars.None;
+  editor.Submit=Submit;editor.TextChanged+=(s,e)=>{if(!updating)Write(new{op="change",value=editor.Text});};Controls.Add(editor);
+  send.BackColor=BackColor;send.AccessibleName="发送消息";send.Click+=(s,e)=>Submit();Controls.Add(send);
+  attachmentLabel.ForeColor=Color.Silver;attachmentLabel.Font=new Font("Microsoft YaHei UI",9);attachmentLabel.AutoEllipsis=true;Controls.Add(attachmentLabel);
+  remove.Text="×";remove.FlatStyle=FlatStyle.Flat;remove.FlatAppearance.BorderSize=0;remove.ForeColor=Color.Silver;
+  remove.Click+=(s,e)=>Write(new{op="clear"});Controls.Add(remove);
+  hover.BackColor=Color.FromArgb(35,35,35);hover.Dock=DockStyle.Fill;
+  var tip=new Label{Text="将文件拖动至此上传",ForeColor=Color.White,TextAlign=ContentAlignment.MiddleCenter,Dock=DockStyle.Fill};hover.Controls.Add(tip);hover.Visible=false;Controls.Add(hover);
+  foreach(Control control in new Control[]{this,editor,send,attachmentLabel,remove,hover,tip}){
+   control.AllowDrop=true;
+   control.DragEnter+=(s,e)=>{bool files=e.Data.GetDataPresent(DataFormats.FileDrop);e.Effect=files?DragDropEffects.Copy:DragDropEffects.None;hover.Visible=files;hover.BringToFront();};
+   control.DragLeave+=(s,e)=>{if(!ClientRectangle.Contains(PointToClient(Cursor.Position)))hover.Visible=false;};
+   control.DragDrop+=(s,e)=>{hover.Visible=false;if(e.Data.GetDataPresent(DataFormats.FileDrop))Write(new{op="drop",paths=(string[])e.Data.GetData(DataFormats.FileDrop)});};
+  }
+  timer.Interval=80;timer.Tick+=(s,e)=>Follow();
+  Resize+=(s,e)=>LayoutInput();
+  FormClosing+=(s,e)=>{if(!closing&&e.CloseReason==CloseReason.UserClosing){e.Cancel=true;SetForegroundWindow(owner.Handle);}};
+  LayoutInput();
+ }
+ protected override bool ShowWithoutActivation{get{return true;}}
+ void StartHidden(){timer.Start();Write(new{op="ready"});new Thread(ReadCommands){IsBackground=true}.Start();Follow();}
+ protected override CreateParams CreateParams {get{var p=base.CreateParams;p.ExStyle|=0x80;return p;}}
+ protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);using(var pen=new Pen(Color.FromArgb(60,60,60)))e.Graphics.DrawRectangle(pen,0,0,Width-1,Height-1);}
+ void LayoutInput(){
+  int footer=string.IsNullOrEmpty(attachment)?0:28;
+  editor.SetBounds(14,14,Math.Max(80,ClientSize.Width-78),Math.Max(32,ClientSize.Height-28-footer));
+  send.SetBounds(ClientSize.Width-55,12,42,Math.Max(42,ClientSize.Height-24-footer));
+  attachmentLabel.SetBounds(14,ClientSize.Height-29,Math.Max(40,ClientSize.Width-60),24);remove.SetBounds(ClientSize.Width-39,ClientSize.Height-31,26,26);
+  attachmentLabel.Visible=remove.Visible=footer!=0;
+ }
+ void Submit(){if(allowSend)Write(new{op="send",value=editor.Text});}
+ void Write(object message){lock(outputLock){Console.Out.WriteLine(json.Serialize(message));Console.Out.Flush();}}
+ void ReadCommands(){
+  try {var readerJson=new JavaScriptSerializer();string line;while((line=Console.In.ReadLine())!=null){var message=readerJson.Deserialize<Message>(line);BeginInvoke((Action)(()=>Apply(message)));}}
+  catch(Exception){ }
+  try{BeginInvoke((Action)(()=>{closing=true;Close();}));}catch{ }
+ }
+ void Apply(Message m){
+  switch(m.op){
+   case "text":updating=true;editor.Text=m.value??"";editor.SelectionStart=editor.TextLength;updating=false;break;
+   case "visible":wanted=m.enabled;Follow();break;
+   case "enabled":allowSend=m.enabled;send.Enabled=allowSend;break;
+   case "attachment":attachment=m.value??"";attachmentLabel.Text=attachment;LayoutInput();Follow();break;
+   case "focus":if(wanted){Follow();SetForegroundWindow(Handle);editor.Focus();}break;
+   case "quit":closing=true;Close();break;
+   case "probe":Rect r;GetWindowRect(owner.Handle,out r);Write(new{op="probe",visible=Visible,value=editor.Text,attachment=attachment,x=Left,y=Top,width=Width,height=Height,ownerBottom=r.bottom,ownerLeft=r.left,ownerWidth=r.right-r.left,owner=owner.Handle.ToInt64(),handle=Handle.ToInt64()});break;
+   case "capture":using(var b=new Bitmap(Width,Height)){DrawToBitmap(b,new Rectangle(0,0,Width,Height));b.Save(m.value);}break;
+  }
+ }
+ void Follow(){
+  if(!IsWindow(owner.Handle)){closing=true;Close();return;}
+  if(!wanted||IsIconic(owner.Handle)||!IsWindowVisible(owner.Handle)){if(Visible)Hide();return;}
+  Rect r;if(!GetWindowRect(owner.Handle,out r))return;
+  var area=Screen.FromHandle(owner.Handle).WorkingArea;int h=string.IsNullOrEmpty(attachment)?90:118;
+  int mainHeight=r.bottom-r.top;
+  // Move the fixed-size phone upward if that leaves room for the input below it.
+  if(r.bottom+6+h>area.Bottom){
+   int y=Math.Max(area.Top,area.Bottom-mainHeight-h-6);
+   if(y<r.top)SetWindowPos(owner.Handle,IntPtr.Zero,r.left,y,0,0,0x15);
+   GetWindowRect(owner.Handle,out r);
+  }
+  int width=Math.Min(r.right-r.left,area.Width);int left=Math.Max(area.Left,Math.Min(r.left,area.Right-width));
+  int top=r.bottom+6;
+  // When the screen cannot fit both vertically, dock the input beside the phone.
+  if(top+h>area.Bottom){
+   if(r.right+6+width<=area.Right)left=r.right+6;
+   else if(r.left-width-6>=area.Left)left=r.left-width-6;
+   else left=Math.Max(area.Left,Math.Min(r.left,area.Right-width));
+   top=Math.Max(area.Top,Math.Min(r.top,area.Bottom-h));
+  }
+  SetBounds(left,top,width,h);if(!Visible)Show(owner);
+ }
+ [STAThread] static void Main(string[] args){
+  try{
+   Console.SetIn(new StreamReader(Console.OpenStandardInput(),new UTF8Encoding(false)));
+   Console.SetOut(new StreamWriter(Console.OpenStandardOutput(),new UTF8Encoding(false)){AutoFlush=true});
+   SetProcessDPIAware();Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);
+   var form=new DetachedInput(new IntPtr(long.Parse(args[0])));var handle=form.Handle;
+   form.BeginInvoke((Action)form.StartHidden);Application.Run(new ApplicationContext(form));
+  }catch(Exception e){Console.Out.WriteLine(new JavaScriptSerializer().Serialize(new{op="error",value=e.Message}));}
+ }
+}

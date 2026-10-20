@@ -30,13 +30,18 @@ public static class AgentChecks
         object history = Activator.CreateInstance(typeof(List<>).MakeGenericType(chatTurn));
         object exchanges = Activator.CreateInstance(typeof(List<>).MakeGenericType(exchange));
         MethodInfo bodyMethod = client.GetMethod("BuildBody", BindingFlags.NonPublic | BindingFlags.Static);
-        string body = (string)bodyMethod.Invoke(null, new object[] { "角色设定", "确认的状态", history, "打开桌面的文件", null, exchanges, false, true });
+        // 参数：finalOnly, requireTool, allowTools, preferCodex, characterRetry, turnRule
+        string body = (string)bodyMethod.Invoke(null, new object[] { "角色设定", "确认的状态", history, "打开桌面的文件", null, exchanges, false, true, true, false, false, null });
         var shape = JsonUtility.FromJson<RequestShape>(body);
         Check(shape != null && shape.model == "deepseek-flash" && shape.tool_choice == "required", "required action tool");
         Check(shape.tools != null && shape.tools.Length == 2 && shape.tools[0].function.name == "computer_action" && shape.tools[1].function.name == "delegate_codex", "computer and Codex tools");
         Check(shape.messages != null && shape.messages.Length >= 3 && shape.messages[shape.messages.Length - 1].role == "user", "request messages");
-        string chatBody = (string)bodyMethod.Invoke(null, new object[] { "角色设定", "", history, "今天过得怎么样？", null, exchanges, false, false });
+        string chatBody = (string)bodyMethod.Invoke(null, new object[] { "角色设定", "", history, "今天过得怎么样？", null, exchanges, false, false, true, false, false, null });
         Check(JsonUtility.FromJson<RequestShape>(chatBody).tool_choice == "auto", "ordinary chat may choose tool");
+        string codexBody = (string)bodyMethod.Invoke(null, new object[] { "角色设定", "", history, "这个项目编译不过", null, exchanges, false, true, true, true, false, null });
+        Check(codexBody.Contains("\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"delegate_codex\"}}"), "classifier codex intent forces delegation");
+        string retryBody = (string)bodyMethod.Invoke(null, new object[] { "角色设定", "", history, "别演了", null, exchanges, false, false, false, false, true, null });
+        Check(retryBody.Contains("刚才的候选回复脱离了牧濑红莉栖的声音") && !retryBody.Contains("\"tools\""), "persona retry adds retry rule");
         Type router = runtime.GetType("KurisuCompanion.AgentRouter", true);
         MethodInfo shouldUseAgent = router.GetMethod("ShouldUseAgent", BindingFlags.Public | BindingFlags.Static);
         Check((bool)shouldUseAgent.Invoke(null, new object[] { "帮我打开桌面上的论文文件" }), "automatic computer routing");
@@ -89,7 +94,7 @@ public static class AgentChecks
             new object[] { apiKey, "你是牧濑红莉栖。用中文回答。", "", history,
                 "搜索记忆神经科学相关论文，给出一个 DOI。", null, approval,
                 (Action<string>)(value => { if (value != null && value.Contains("正在执行：paper_search")) calledTool = true; }),
-                (Action<string>)(value => answer = value), (Action<string>)(value => error = value) });
+                (Action<string>)(value => answer = value), (Action<string>)(value => error = value), null, null, null });
         Pump(request);
         Check(error == null, "live API request: " + error);
         Check(calledTool, "live paper_search tool call");

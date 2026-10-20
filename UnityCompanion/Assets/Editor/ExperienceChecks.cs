@@ -98,7 +98,7 @@ public static class ExperienceChecks
             new object[] { key, "你是牧濑红莉栖。用中文回答。", "", history,
                 "你看看我的电脑屏幕里面有什么，简短描述。", null, approval,
                 (Action<string>)(value => { if (value != null && value.Contains("capture_screen")) captured = true; }),
-                (Action<string>)(value => answer = value), (Action<string>)(value => error = value) });
+                (Action<string>)(value => answer = value), (Action<string>)(value => error = value), null, null, null });
         Pump(request);
         Check(error == null && captured && !string.IsNullOrWhiteSpace(answer), "live screenshot model loop: " + error);
         Debug.Log("KURISU_VISION_LIVE_OK");

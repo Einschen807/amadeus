@@ -2,8 +2,29 @@ using System;
 
 namespace KurisuCompanion
 {
+    // 三级路由：规则能确定的直接决定（零延迟）；规则拿不准时交给轻量意图分类（IntentClassifier）；
+    // 生成后若模型仍声称"无法访问设备"，AgentClient 会再强制调用一次工具。
+    internal enum RouteDecision { Chat, Computer, Codex, Ambiguous }
+
     internal static class AgentRouter
     {
+        public static RouteDecision Decide(string text)
+        {
+            text = (text ?? "").Trim();
+            if (CodexRouter.IsComplexRequest(text)) return RouteDecision.Codex;
+            if (ShouldUseAgent(text)) return RouteDecision.Computer;
+            // 提到电脑对象（文件、网页、屏幕……）却没有命中明确句式，例如"为什么这个网页打不开，帮我看看"。
+            return MentionsComputerTarget(text) && !IsNarrative(text) ? RouteDecision.Ambiguous : RouteDecision.Chat;
+        }
+
+        // 用户在讲述已经发生的事，而不是下达指令。
+        private static bool IsNarrative(string text)
+        {
+            if (IsDirectRequest(text)) return false;
+            return text.Contains("我刚") || text.Contains("我昨天") || text.Contains("我之前") || text.Contains("我已经") ||
+                   text.Contains("今天我") || text.EndsWith("了", StringComparison.Ordinal) || text.EndsWith("了。", StringComparison.Ordinal);
+        }
+
         private static readonly string[] Verbs =
         {
             "打开浏览器", "打开文件", "打开目录", "打开文件夹", "打开网页", "打开网站",

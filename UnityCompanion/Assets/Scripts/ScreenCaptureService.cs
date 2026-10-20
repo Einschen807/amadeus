@@ -4,6 +4,13 @@ using UnityEngine;
 
 namespace KurisuCompanion
 {
+    internal sealed class ScreenFrame
+    {
+        public readonly int Width, Height;
+        public readonly byte[] Bgra;
+        public ScreenFrame(int width, int height, byte[] bgra) { Width = width; Height = height; Bgra = bgra; }
+    }
+
     internal static class ScreenCaptureService
     {
         private const int Srccopy = 0x00CC0020;
@@ -37,10 +44,55 @@ namespace KurisuCompanion
         [DllImport("gdi32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool BitBlt(IntPtr destination, int dx, int dy, int width, int height,
             IntPtr source, int sx, int sy, int operation);
+        [DllImport("gdi32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool StretchBlt(IntPtr destination, int dx, int dy, int width, int height,
+            IntPtr source, int sx, int sy, int sourceWidth, int sourceHeight, int operation);
+        [DllImport("gdi32.dll")] private static extern int SetStretchBltMode(IntPtr dc, int mode);
         [DllImport("gdi32.dll")] private static extern int GetDIBits(IntPtr dc, IntPtr bitmap,
             uint firstLine, uint lineCount, byte[] pixels, ref BitmapInfo info, uint usage);
         [DllImport("gdi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool DeleteObject(IntPtr obj);
         [DllImport("gdi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool DeleteDC(IntPtr dc);
+
+        // Only Win32 calls and managed arrays: safe to run on a worker thread.
+        public static ScreenFrame CaptureScaled(int maxLongSide)
+        {
+            int sourceWidth = GetSystemMetrics(0), sourceHeight = GetSystemMetrics(1);
+            if (sourceWidth <= 0 || sourceHeight <= 0 || (long)sourceWidth * sourceHeight > 33000000)
+                throw new InvalidOperationException("主屏幕尺寸异常，无法抓取。");
+            float scale = Math.Min(1f, maxLongSide / (float)Math.Max(sourceWidth, sourceHeight));
+            int width = Math.Max(1, (int)Math.Round(sourceWidth * scale));
+            int height = Math.Max(1, (int)Math.Round(sourceHeight * scale));
+            IntPtr screen = IntPtr.Zero, memory = IntPtr.Zero, bitmap = IntPtr.Zero, old = IntPtr.Zero;
+            try
+            {
+                screen = GetDC(IntPtr.Zero);
+                if (screen == IntPtr.Zero) throw new InvalidOperationException("无法读取当前桌面。");
+                memory = CreateCompatibleDC(screen);
+                bitmap = CreateCompatibleBitmap(screen, width, height);
+                if (memory == IntPtr.Zero || bitmap == IntPtr.Zero)
+                    throw new InvalidOperationException("无法创建缩略屏幕图像。");
+                old = SelectObject(memory, bitmap);
+                SetStretchBltMode(memory, 4); // HALFTONE
+                if (!StretchBlt(memory, 0, 0, width, height, screen, 0, 0, sourceWidth, sourceHeight, Srccopy | CaptureBlt))
+                    throw new InvalidOperationException("Windows 无法缩小屏幕画面。");
+                var info = new BitmapInfo { header = new BitmapInfoHeader
+                {
+                    size = (uint)Marshal.SizeOf(typeof(BitmapInfoHeader)), width = width, height = height,
+                    planes = 1, bitCount = 32, compression = 0
+                } };
+                byte[] pixels = new byte[width * height * 4];
+                if (GetDIBits(screen, bitmap, 0, (uint)height, pixels, ref info, 0) == 0)
+                    throw new InvalidOperationException("无法读取缩略屏幕像素。");
+                return new ScreenFrame(width, height, pixels);
+            }
+            finally
+            {
+                if (old != IntPtr.Zero && memory != IntPtr.Zero) SelectObject(memory, old);
+                if (bitmap != IntPtr.Zero) DeleteObject(bitmap);
+                if (memory != IntPtr.Zero) DeleteDC(memory);
+                if (screen != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screen);
+            }
+        }
 
         public static string CapturePrimaryScreen()
         {

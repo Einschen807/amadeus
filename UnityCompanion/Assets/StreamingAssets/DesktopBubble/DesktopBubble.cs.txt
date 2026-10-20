@@ -1,0 +1,275 @@
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Web.Script.Serialization;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Shapes;
+using System.Windows.Threading;
+
+// A transparent owned desktop window keeps speech outside the fixed Unity phone.
+internal sealed class DesktopBubble : Window
+{
+    [StructLayout(LayoutKind.Sequential)] private struct Rect { public int left, top, right, bottom; }
+    [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr h, out Rect r);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int height, uint flags);
+    [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr h, int index);
+    [DllImport("user32.dll")] private static extern int SetWindowLong(IntPtr h, int index, int value);
+    [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr h);
+
+    private sealed class Command { public string op { get; set; } public string text { get; set; } public string path { get; set; } }
+    private readonly JavaScriptSerializer json = new JavaScriptSerializer();
+    private readonly IntPtr owner;
+    private readonly Canvas canvas = new Canvas();
+    private readonly Canvas design = new Canvas();
+    private readonly System.Windows.Shapes.Path outline = new System.Windows.Shapes.Path();
+    private readonly TextBlock caption = new TextBlock();
+    private readonly DispatcherTimer followTimer = new DispatcherTimer();
+    private IntPtr handle;
+    private bool wanted, tailOnLeft, closing;
+    private int targetX, targetY, targetWidth, targetHeight;
+
+    private DesktopBubble(IntPtr parent)
+    {
+        owner = parent;
+        WindowStyle = WindowStyle.None;
+        ResizeMode = ResizeMode.NoResize;
+        AllowsTransparency = true;
+        Background = Brushes.Transparent;
+        ShowInTaskbar = false;
+        ShowActivated = false;
+        Opacity = 0;
+        Width = 520;
+        Height = 180;
+        new WindowInteropHelper(this).Owner = owner;
+        Content = canvas;
+        IsHitTestVisible = false;
+
+        var paper = new LinearGradientBrush();
+        paper.StartPoint = new Point(.5, 0);
+        paper.EndPoint = new Point(.5, 1);
+        paper.GradientStops.Add(new GradientStop(Color.FromArgb(255, 250, 253, 252), 0));
+        paper.GradientStops.Add(new GradientStop(Color.FromArgb(255, 250, 253, 252), .03));
+        paper.GradientStops.Add(new GradientStop(Color.FromArgb(153, 250, 253, 252), .5));
+        paper.GradientStops.Add(new GradientStop(Color.FromArgb(255, 250, 253, 252), .97));
+        paper.GradientStops.Add(new GradientStop(Color.FromArgb(255, 250, 253, 252), 1));
+        outline.Fill = paper;
+        var border = new LinearGradientBrush();
+        border.StartPoint = new Point(.5, 0);
+        border.EndPoint = new Point(.5, 1);
+        border.GradientStops.Add(new GradientStop(Color.FromArgb(135, 215, 227, 225), 0));
+        border.GradientStops.Add(new GradientStop(Color.FromArgb(135, 215, 227, 225), .03));
+        border.GradientStops.Add(new GradientStop(Color.FromArgb(90, 215, 227, 225), .5));
+        border.GradientStops.Add(new GradientStop(Color.FromArgb(135, 215, 227, 225), .97));
+        border.GradientStops.Add(new GradientStop(Color.FromArgb(135, 215, 227, 225), 1));
+        outline.Stroke = border;
+        outline.StrokeThickness = 1;
+        canvas.Children.Add(outline);
+        design.IsHitTestVisible = false;
+        var drawingFade = new LinearGradientBrush();
+        drawingFade.StartPoint = new Point(.5, 0);
+        drawingFade.EndPoint = new Point(.5, 1);
+        drawingFade.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 255, 255), 0));
+        drawingFade.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 255, 255), .03));
+        drawingFade.GradientStops.Add(new GradientStop(Color.FromArgb(255, 255, 255, 255), .5));
+        drawingFade.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 255, 255), .97));
+        drawingFade.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 255, 255), 1));
+        design.OpacityMask = drawingFade;
+        canvas.Children.Add(design);
+        caption.Foreground = new SolidColorBrush(Color.FromRgb(18, 22, 22));
+        caption.FontFamily = new FontFamily("Microsoft YaHei UI");
+        caption.FontSize = 17;
+        caption.FontWeight = FontWeights.SemiBold;
+        caption.TextWrapping = TextWrapping.Wrap;
+        canvas.Children.Add(caption);
+
+        SizeChanged += delegate { Draw(); };
+        SourceInitialized += delegate
+        {
+            handle = new WindowInteropHelper(this).Handle;
+            int style = GetWindowLong(handle, -20);
+            SetWindowLong(handle, -20, style | 0x20 | 0x80 | 0x08000000); // click-through, tool, no activate
+            followTimer.Interval = TimeSpan.FromMilliseconds(60);
+            followTimer.Tick += delegate { if (wanted) Follow(); };
+            followTimer.Start();
+            var reader = new Thread(ReadCommands); reader.IsBackground = true; reader.Start();
+            Write(new { op = "ready", owner = owner.ToInt64() });
+        };
+        Closed += delegate { closing = true; System.Windows.Application.Current.Shutdown(); };
+    }
+
+    private void ReadCommands()
+    {
+        try
+        {
+            string line;
+            while (!closing && (line = Console.ReadLine()) != null)
+            {
+                Command command;
+                try { command = json.Deserialize<Command>(line); }
+                catch { continue; }
+                Dispatcher.BeginInvoke(new Action(delegate { Apply(command); }));
+            }
+        }
+        catch (Exception error) { Write(new { op = "error", text = error.Message }); }
+        finally { Dispatcher.BeginInvoke(new Action(delegate { Close(); })); }
+    }
+
+    private void Apply(Command command)
+    {
+        if (command == null) return;
+        if (command.op == "show")
+        {
+            caption.Text = command.text ?? "";
+            wanted = caption.Text.Length > 0;
+            if (wanted) Follow(); else Hide();
+        }
+        else if (command.op == "hide") { wanted = false; Hide(); }
+        else if (command.op == "probe") Probe();
+        else if (command.op == "capture") Capture(command.path);
+        else if (command.op == "quit") { closing = true; Close(); }
+    }
+
+    private void Follow()
+    {
+        Rect phone;
+        if (!GetWindowRect(owner, out phone) || IsIconic(owner) || !IsWindowVisible(owner))
+        {
+            if (IsVisible) Hide();
+            return;
+        }
+        var area = System.Windows.Forms.Screen.FromHandle(owner).WorkingArea;
+        int leftSpace = phone.left - area.Left - 12;
+        int rightSpace = area.Right - phone.right - 12;
+        bool left = (phone.left + phone.right) / 2 >= (area.Left + area.Right) / 2;
+        if (left && leftSpace < 180 && rightSpace > leftSpace) left = false;
+        if (!left && rightSpace < 180 && leftSpace > rightSpace) left = true;
+        int available = left ? leftSpace : rightSpace;
+        int width = Math.Min(760, Math.Max(160, available - 8));
+        double scale = Math.Max(1, GetDpiForWindow(handle) / 96.0);
+        caption.Width = Math.Max(100, width / scale - 74);
+        caption.Measure(new Size(caption.Width, double.PositiveInfinity));
+        int height = (int)Math.Ceiling((caption.DesiredSize.Height + 65) * scale);
+        height = Math.Max(180, Math.Min(Math.Min(370, area.Height - 20), height));
+        int x = left ? phone.left - width - 12 : phone.right + 12;
+        x = Math.Max(area.Left + 4, Math.Min(x, area.Right - width - 4));
+        int y = phone.top + (phone.bottom - phone.top) / 2 - height / 2;
+        y = Math.Max(area.Top + 4, Math.Min(y, area.Bottom - height - 4));
+        bool changed = x != targetX || y != targetY || width != targetWidth || height != targetHeight || left != !tailOnLeft;
+        targetX = x; targetY = y; targetWidth = width; targetHeight = height;
+        tailOnLeft = !left;
+        if (!IsVisible) { Opacity = 1; Show(); changed = true; }
+        if (changed) { SetWindowPos(handle, IntPtr.Zero, x, y, width, height, 0x14); Draw(); }
+    }
+
+    private void Draw()
+    {
+        double w = ActualWidth, h = ActualHeight;
+        if (w < 100 || h < 70) return;
+        double edge = tailOnLeft ? 32 : 0;
+        double far = tailOnLeft ? w : w - 32;
+        var shape = new StreamGeometry();
+        using (var g = shape.Open())
+        {
+            g.BeginFigure(new Point(edge + 10, 0), true, true);
+            g.LineTo(new Point(far - 10, 0), true, false);
+            g.LineTo(new Point(far, 10), true, false);
+            if (!tailOnLeft)
+            {
+                g.LineTo(new Point(far, h * .40), true, false);
+                g.LineTo(new Point(w, h * .50), true, false);
+                g.LineTo(new Point(far, h * .62), true, false);
+            }
+            g.LineTo(new Point(far, h - 10), true, false);
+            g.LineTo(new Point(far - 10, h), true, false);
+            g.LineTo(new Point(edge + 10, h), true, false);
+            g.LineTo(new Point(edge, h - 10), true, false);
+            if (tailOnLeft)
+            {
+                g.LineTo(new Point(edge, h * .62), true, false);
+                g.LineTo(new Point(0, h * .50), true, false);
+                g.LineTo(new Point(edge, h * .40), true, false);
+            }
+            g.LineTo(new Point(edge, 10), true, false);
+        }
+        shape.Freeze();
+        outline.Data = shape;
+        design.Clip = shape;
+        Canvas.SetLeft(caption, tailOnLeft ? 50 : 18);
+        Canvas.SetTop(caption, 18);
+        design.Children.Clear();
+        double baseX = tailOnLeft ? 44 : 14;
+        for (int i = 0; i < 3; i++)
+        {
+            double radius = i == 1 ? 45 : 30;
+            double cx = baseX + 74 + i * (w - 110) / 3.0;
+            double cy = h - 10 - (i % 2) * 12;
+            var circle = new Ellipse { Width = radius * 2, Height = radius * 2,
+                Stroke = new SolidColorBrush(Color.FromArgb(50, 91, 137, 139)), StrokeThickness = .8 };
+            Canvas.SetLeft(circle, cx - radius); Canvas.SetTop(circle, cy - radius);
+            design.Children.Add(circle);
+            AddLine(cx - radius, cy - radius * .5, cx + radius, cy + radius * .5);
+            AddLine(cx - radius * .6, cy + radius, cx + radius * .6, cy - radius);
+        }
+    }
+
+    private void AddLine(double x1, double y1, double x2, double y2)
+    {
+        design.Children.Add(new Line { X1 = x1, Y1 = y1, X2 = x2, Y2 = y2,
+            Stroke = new SolidColorBrush(Color.FromArgb(42, 91, 137, 139)), StrokeThickness = .8 });
+    }
+
+    private void Probe()
+    {
+        Rect phone, bubble;
+        GetWindowRect(owner, out phone);
+        GetWindowRect(handle, out bubble);
+        Write(new { op = "probe", visible = IsVisible, side = tailOnLeft ? "right" : "left",
+            x = bubble.left, y = bubble.top, width = bubble.right - bubble.left,
+            height = bubble.bottom - bubble.top, ownerLeft = phone.left,
+            ownerRight = phone.right, ownerTop = phone.top, ownerBottom = phone.bottom,
+            edgeTransparency = 0, centerTransparency = 40, text = caption.Text });
+    }
+
+    private void Capture(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !IsVisible) return;
+        double scale = Math.Max(1, GetDpiForWindow(handle) / 96.0);
+        var image = new RenderTargetBitmap((int)Math.Ceiling(ActualWidth * scale),
+            (int)Math.Ceiling(ActualHeight * scale), 96 * scale, 96 * scale, PixelFormats.Pbgra32);
+        image.Render(this);
+        var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(image));
+        using (var stream = File.Create(path)) encoder.Save(stream);
+        Write(new { op = "capture", path = path });
+    }
+
+    private void Write(object reply)
+    {
+        try { Console.WriteLine(json.Serialize(reply)); }
+        catch { }
+    }
+
+    [STAThread] private static void Main(string[] args)
+    {
+        try
+        {
+            if (args.Length != 1) return;
+            SetProcessDPIAware();
+            Console.SetIn(new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false)));
+            Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true });
+            var app = new System.Windows.Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+            var window = new DesktopBubble(new IntPtr(long.Parse(args[0])));
+            window.Show(); window.Hide();
+            app.Run();
+        }
+        catch (Exception error) { Console.WriteLine("{\"op\":\"error\",\"text\":\"" + error.Message.Replace("\"", "'") + "\"}"); }
+    }
+}

@@ -121,7 +121,7 @@ namespace KurisuCompanion
                 }
                 catch (Exception e) { failure = e.Message; }
                 if (failure != null) { error(failure); yield break; }
-                yield return rpc.Request("initialize", RpcJson.Obj("clientInfo", RpcJson.Obj("name", "amadeus_unity", "title", "Kurisu Companion", "version", "0.3.0")),
+                yield return rpc.Request("initialize", RpcJson.Obj("clientInfo", RpcJson.Obj("name", "amadeus_unity", "title", "Amadeus", "version", "0.3.0")),
                     value => { }, value => failure = value);
                 if (failure != null) { Shutdown(); error(failure); yield break; }
                 if (!rpc.Write(RpcJson.Obj("method", "initialized", "params", RpcJson.Obj()))) error(rpc.Error);

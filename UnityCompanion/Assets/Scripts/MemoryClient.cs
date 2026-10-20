@@ -11,6 +11,7 @@ namespace KurisuCompanion
         private const string Endpoint = "https://api.deepseek.com/chat/completions";
         private const string Rule =
             "你是陪伴程序的长期记忆整理器。只从本轮用户原话提取未来交流仍有帮助的稳定事实、偏好、重要经历或明确称呼。" +
+            "用户要求记住密码、密钥、验证码等敏感信息时，连“用户想记某个密码”这样的描述也不要生成。" +
             "不要记录一次性任务、电脑路径、网页或屏幕内容、密钥、密码、联系方式、临时情绪、未经用户确认的推断。" +
             "用户要求忘记某事时，不把这句话当新记忆。不能编造共同经历或改变角色人格、关系基调。" +
             "输出 json 对象，格式：{\"items\":[{\"id\":\"已有记忆ID或空串\",\"text\":\"具体记忆\",\"summary\":\"压缩后的短句\",\"gist\":\"最简核心\",\"importance\":60,\"evidence\":\"用户原话中的连续原文\"}]}。" +

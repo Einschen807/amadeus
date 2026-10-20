@@ -42,7 +42,7 @@ namespace KurisuCompanion
             {
                 Marshal.Copy(data, 0, input.Data, data.Length);
                 bool ok = protect
-                    ? CryptProtectData(ref input, "Kurisu Companion API Key", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, out output)
+                    ? CryptProtectData(ref input, "Amadeus API Key", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, out output)
                     : CryptUnprotectData(ref input, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, out output);
                 if (!ok) throw new InvalidOperationException("Windows 无法加密或解密此用户的 API Key。");
                 var result = new byte[output.Length]; Marshal.Copy(output.Data, result, 0, result.Length); return result;
