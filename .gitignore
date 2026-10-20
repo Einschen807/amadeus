@@ -3,14 +3,22 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/docs/
 !/UnityCompanion/
 !/EmoteTest/
 !/.codex-integration/
 !/牧濑红莉栖_陪伴型AI人格设定.md
-!/启动红莉栖陪伴程序.cmd
-!/启动红莉栖测试.cmd
+!/启动Amadeus.cmd
 
-# Unity source, settings and dependency manifests; never generated state.
+# Built player, trained voice models and other large local binaries never enter the repository.
+/Amadeus_Windows/
+/Amadeus_Preview/
+/语音模型/
+*.ckpt
+*.pth
+*.psb
+
+# Unity source, settings and dependency manifests; never generated state (Library, Temp, Logs, UserSettings).
 /UnityCompanion/*
 !/UnityCompanion/.gitignore
 !/UnityCompanion/README.md
@@ -18,9 +26,13 @@
 !/UnityCompanion/Packages/
 !/UnityCompanion/ProjectSettings/
 
-# Game-derived portrait stays local until distribution rights are confirmed.
+# Game-derived artwork stays local; the demo is shown privately, not distributed.
 /UnityCompanion/Assets/Resources/kurisu.png
 /UnityCompanion/Assets/Resources/kurisu.png.meta
+/UnityCompanion/Assets/Resources/kurisu-mouth-open.png
+/UnityCompanion/Assets/Resources/kurisu-mouth-open.png.meta
+/UnityCompanion/Assets/Resources/AmadeusWallpaper.png
+/UnityCompanion/Assets/Resources/AmadeusWallpaper.png.meta
 
 # Preserve the optional renderer's source and third-party notice only.
 /EmoteTest/*
@@ -32,17 +44,22 @@
 !/EmoteTest/README.md
 !/EmoteTest/FreeMote.LICENSE.txt
 
-# The editor checks depend on this fixture, but their runs contain local data.
-/.codex-integration/*
-!/.codex-integration/mock_server.py
+# Integration scripts are source; their run outputs are local data.
+/.codex-integration/checks-*/
+/.codex-integration/mock-trace.jsonl
+/.codex-integration/mock-error.txt
+/.codex-integration/**/__pycache__/
+/.codex-integration/**/*.wav
+/.codex-integration/**/*.png
 
-# Local credentials, conversations and generated files (including future copies).
+# Local credentials, conversations, metrics and generated files (including future copies).
 .env
 .env.*
 !.env.example
 deepseek-key.bin
 conversation.json
 conversation.json.*
+metrics.json
 codex-settings.json
 codex-tasks.json
 codex-tasks.json.*
@@ -53,3 +70,13 @@ auth.json
 __pycache__/
 .vs/
 .idea/
+
+# Voice reference clip is source material from the original game; kept local like the portraits.
+/UnityCompanion/Assets/StreamingAssets/Voice/reference.wav
+/UnityCompanion/Assets/StreamingAssets/Voice/reference.wav.meta
+
+# Helper programs are compiled from their .cs.txt sources by ProjectSetup.BuildWindows.
+/UnityCompanion/Assets/StreamingAssets/DesktopBubble/*.exe
+/UnityCompanion/Assets/StreamingAssets/DesktopBubble/*.exe.meta
+/UnityCompanion/Assets/StreamingAssets/DesktopInput/*.exe
+/UnityCompanion/Assets/StreamingAssets/DesktopInput/*.exe.meta
